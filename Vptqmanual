@@ -1,0 +1,102 @@
+import math
+
+# VPTQ quantization settings
+vector_len = 8
+main_codebook_size = 256    # K (number of centroids for main codebook)
+res_codebook_size = 256     # K_res (number of centroids for residual)
+
+# Storage for quantized state dict
+quantized_state_dict = {}
+
+# Helper: K-means clustering (Lloyd's algorithm) for a set of vectors
+def kmeans_cluster(vectors, K, n_iterations=10):
+    N, dim = vectors.shape
+    # Randomly choose K distinct vectors as initial centroids
+    # (if N < K, we take all vectors as centroids, padding if needed)
+    if N >= K:
+        initial_idx = torch.randperm(N)[:K]
+        centroids = vectors[initial_idx].clone()
+    else:
+        # Rare case: fewer vectors than centroids
+        centroids = torch.cat([vectors, vectors[torch.randperm(N)[:(K-N)]]], dim=0)
+    # Run Lloyd's iterations
+    for it in range(n_iterations):
+        # Compute distances from vectors to centroids [N x K]
+        # Using broadcast: squared distance = sum((vector - centroid)^2)
+        # shape: (N, 1, dim) vs (1, K, dim) -> (N, K, dim) -> sum_dim -> (N, K)
+        distances = (vectors.unsqueeze(1) - centroids.unsqueeze(0)).pow(2).sum(dim=2)
+        # Assign each vector to nearest centroid (smallest distance)
+        cluster_idx = distances.argmin(dim=1)
+        # If no change in assignment, we can break early (converged)
+        if it == n_iterations-1 or (it > 0 and cluster_idx.equal(prev_idx)):
+            break
+        prev_idx = cluster_idx
+        # Update centroids as mean of assigned vectors
+        for k in range(K):
+            # gather vectors for which cluster_idx == k
+            mask = (cluster_idx == k)
+            if mask.any():
+                centroids[k] = vectors[mask].mean(dim=0)
+            # If a centroid loses all its vectors, we keep it unchanged (or could reinit)
+    return centroids, cluster_idx
+
+# Iterate through each parameter tensor in the model
+for name, param in model.named_parameters():
+    if not param.requires_grad:
+        # Skip parameters that are not trained (just in case)
+        continue
+    # We will quantize only weight matrices (2D) of linear layers
+    if param.dim() == 2:
+        W = param.data.cpu()  # get weight matrix on CPU
+        out_dim, in_dim = W.shape
+        # Determine grouping along input dimension (in_dim) by vector_len
+        # If in_dim is not a multiple of vector_len, pad vectors with zeros for clustering
+        pad = 0
+        if in_dim % vector_len != 0:
+            pad = vector_len - (in_dim % vector_len)
+        # Reshape weight matrix into (out_dim * groups) x vector_len vectors
+        if pad > 0:
+            W_padded = torch.nn.functional.pad(W, (0, pad))  # pad columns
+        else:
+            W_padded = W
+        # Now split into vectors of length 'vector_len'
+        new_in_dim = W_padded.shape[1]  # in_dim + pad
+        num_vecs = out_dim * (new_in_dim // vector_len)
+        vectors = W_padded.view(-1, vector_len)  # shape: (num_vecs, vector_len)
+        
+        # Main codebook clustering
+        centroids_main, idx_main = kmeans_cluster(vectors, K=main_codebook_size, n_iterations=10)
+        # Quantize: replace each vector with its centroid
+        quantized_vectors = centroids_main[idx_main]
+        
+        # Residual quantization (if using a residual codebook)
+        if res_codebook_size is not None and res_codebook_size > 0:
+            # Compute residual vectors
+            residuals = vectors - quantized_vectors
+            # Cluster residuals
+            centroids_res, idx_res = kmeans_cluster(residuals, K=res_codebook_size, n_iterations=5)
+            # Add residual centroid to quantized vectors
+            quantized_vectors += centroids_res[idx_res]
+        else:
+            # No residual codebook
+            idx_res = None
+            centroids_res = None
+        
+        # Reshape quantized vectors back to original weight shape (remove padding)
+        quantized_W_full = quantized_vectors.view(out_dim, new_in_dim)
+        if pad > 0:
+            quantized_W_full = quantized_W_full[:, :in_dim]  # remove padded columns
+        
+        # Store the quantized weight matrix in state_dict (keep same name)
+        quantized_state_dict[name] = quantized_W_full.to(param.dtype)
+    else:
+        # For biases or other parameters (norms), keep the original (or could skip entirely)
+        quantized_state_dict[name] = param.data.cpu().clone()
+
+print("Quantization complete. Constructing quantized model...")
+# Create a new model instance for the quantized weights
+quantized_model = AutoModelForImageClassification.from_pretrained(
+    pretrained_model_path, state_dict=quantized_state_dict
+)
+quantized_model.to(device)
+quantized_model.eval()
