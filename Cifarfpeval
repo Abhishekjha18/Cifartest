@@ -1,0 +1,19 @@
+# Evaluate the full-precision model on CIFAR-10 test set
+correct = 0
+total = 0
+batch_size = 32
+
+for i in range(0, len(test_dataset), batch_size):
+    images = []
+    labels = []
+    for j in range(i, min(i+batch_size, len(test_dataset))):
+        img, label = test_dataset[j]
+        images.append(img)
+        labels.append(label)
+    labels = torch.tensor(labels)
+    preds = predict_batch(model, images)
+    correct += (preds == labels).sum().item()
+    total += len(labels)
+
+full_precision_accuracy = correct / total
+print(f"Full-Precision Model Accuracy: {full_precision_accuracy*100:.2f}%")
