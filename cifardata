@@ -1,0 +1,15 @@
+from torchvision import datasets
+
+# Load CIFAR-10 test set (without transform, we'll apply the image_processor manually)
+test_dataset = datasets.CIFAR10(root="~/Downloads", train=False, download=True)
+
+# Function to get model predictions for a batch of images
+def predict_batch(model, images):
+    # Apply the image processor to the list of PIL images
+    inputs = image_processor(images, return_tensors="pt")
+    pixel_values = inputs["pixel_values"].to(device)
+    with torch.no_grad():
+        outputs = model(pixel_values)
+    # Get predicted class indices (the model's logits argmax)
+    preds = outputs.logits.argmax(dim=1).cpu()
+    return preds
