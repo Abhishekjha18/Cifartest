@@ -1,0 +1,14 @@
+import torch
+from sklearn.cluster import KMeans
+
+# 1. Load the saved model (state_dict) and move to CPU
+model = MyCNNModel()  # instantiate your model class (replace with actual class name)
+state_dict = torch.load('model.pth', map_location='cpu')  # load weights to CPU
+model.load_state_dict(state_dict)                         # load weights into model
+model.eval()  # set to evaluation mode (good practice if we plan to do inference)
+
+# 2. Access the fc3 layer's weight tensor
+fc3_weight_tensor = model.fc3.weight            # this is a PyTorch Parameter
+fc3_weights = fc3_weight_tensor.detach().cpu().numpy()  
+# detach() to avoid gradients, move to CPU, convert to NumPy for KMeans
+print("fc3 weights shape:", fc3_weights.shape)  # e.g., (10, 84) for a 10-class model
