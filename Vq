@@ -1,0 +1,45 @@
+import numpy as np                             # 1
+from sklearn.cluster import KMeans             # 2
+
+def compress_vectors(X, n_clusters):           # 3
+    """
+    Compress X by assigning each vector to one of n_clusters centroids.
+    Returns:
+      - labels: an array of cluster indices for each vector in X
+      - centroids: the coordinates of the cluster centers
+    """
+    kmeans = KMeans(
+        n_clusters=n_clusters,                  # 4: how many clusters/code vectors
+        random_state=42                         # 5: seed for reproducibility
+    )
+    labels = kmeans.fit_predict(X)              # 6: fit on X and get each point’s cluster index
+    centroids = kmeans.cluster_centers_         # 7: the learned centroids
+    return labels, centroids                    # 8
+
+def decompress_vectors(labels, centroids):      # 9
+    """
+    Reconstruct approximate vectors by looking up centroids[labels].
+    """
+    return centroids[labels]                    # 10
+
+if __name__ == "__main__":                     # 11
+    # --- Example data: five 2D points ---
+    X = np.array([
+        [1,  2],
+        [1,  1],
+        [4,  5],
+        [4,  4],
+        [10, 10]
+    ])                                           # 12
+
+    # Compress into 3 clusters
+    labels, centroids = compress_vectors(X, n_clusters=3)  # 13
+
+    # Decompress back to approximate vectors
+    X_approx = decompress_vectors(labels, centroids)      # 14
+
+    # Display results
+    print("Original Vectors:\n", X)                  # 15
+    print("Cluster Labels:\n", labels)               # 16
+    print("Centroids:\n", centroids)                 # 17
+    print("Reconstructed Vectors:\n", X_approx)      # 18
