@@ -1,0 +1,30 @@
+# 3. Flatten the weight matrix and apply K-means clustering
+weight_values = fc3_weights.reshape(-1, 1)   # shape (N, 1), where N is total number of weights in fc3
+n_clusters = 16                              # choose number of clusters (quantized values)
+kmeans = KMeans(n_clusters=n_clusters, n_init=10, random_state=0)
+kmeans.fit(weight_values)                    # cluster the weight values
+
+# 4. Obtain cluster centers and labels for each weight
+cluster_centers = kmeans.cluster_centers_.squeeze()  # shape (n_clusters,), the centroid values
+labels = kmeans.labels_                             # shape (N,), label assignment for each weight
+print(f"Found {len(cluster_centers)} clusters for fc3 weights.")
+
+# 5. Construct the quantized weight matrix using the cluster centroids
+quantized_weights_np = cluster_centers[labels]      # replace each weight with its cluster's centroid
+quantized_weights_np = quantized_weights_np.reshape(fc3_weights.shape)  # reshape to original shape
+
+# 6. Convert the quantized weights to a PyTorch tensor with the same dtype/device as original
+quantized_weights_tensor = torch.tensor(quantized_weights_np, dtype=fc3_weight_tensor.dtype)
+# If the model was on GPU (not in this case since we moved to CPU), you'd also do .to(device) as needed.
+
+# 7. Assign the quantized weights back to the model's fc3 layer
+with torch.no_grad():
+    model.fc3.weight.copy_(quantized_weights_tensor)  
+    # Using copy_ ensures the data is copied into the existing weight tensor.
+    # We avoid in-place operations on leaf tensors that require grad by using no_grad().
+    
+# (Optionally, leave bias unchanged; we typically quantize weights and not bias in this simple scheme)
+
+state = model.state_dict()
+state['fc3.weight'] = quantized_weights_tensor  # update the weight in the state dict
+model.load_state_dict(state)
