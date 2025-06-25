@@ -1,0 +1,42 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+
+class LookupLinear(nn.Module):
+    """
+    Drop-in replacement for nn.Linear that stores
+    W as <centroids[K] + uint8 indices[out,in]>.
+    """
+    def __init__(self, centroids, indices, bias):
+        super().__init__()
+        self.register_buffer("centroids", centroids)   # (K,)
+        self.register_buffer("indices",  indices)      # (out,in) uint8 / uint16
+        if bias is not None:
+            self.register_parameter("bias", nn.Parameter(bias))
+        else:
+            self.register_parameter("bias", None)
+
+    def forward(self, x):
+        # Gather real weights on the fly: (out,in)
+        W = self.centroids[self.indices]
+        return F.linear(x, W, self.bias)
+
+# ----------------- build the full model -----------------
+
+model = MyCNNModel()                 # original architecture (unused fc3)
+state = torch.load("cifar_net.pth", map_location="cpu")
+
+# --- load compressed fc3 from NPZ ---
+q = np.load("quantized_fc3.npz")
+centroids = torch.tensor(q["centroids"], dtype=torch.float32)     # (K,)
+indices   = torch.tensor(q["indices"],   dtype=torch.uint8)       # (out*in,)
+indices   = indices.reshape(tuple(q["shape"]))                    # (out,in)
+bias      = state["fc3.bias"]                                     # keep FP32
+
+# --- create compressed layer and plug it in ---
+lookup_fc3 = LookupLinear(centroids, indices, bias)
+model.fc3 = lookup_fc3            # hot-swap layer
+del state["fc3.weight"]           # not needed any more
+model.load_state_dict(state, strict=False)
+model.eval()
