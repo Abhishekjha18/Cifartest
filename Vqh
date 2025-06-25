@@ -58,3 +58,22 @@ print(f"Original size      : {original_bits} bits")
 print(f"Compressed size    : {compressed_bits} bits "
       f"(indices {index_bits}  +  centroids {centroid_bits})")
 print(f"Compression ratio  : {compression:.2f}×")
+# ────────────────────────────────────────
+#  ‼️ CONTINUATION:  Reconstruct & compare
+# ────────────────────────────────────────
+
+# --- 1) Reconstruct each 2-D sub-vector with its centroid -------------
+X_hat = centroid[labels]          # shape (m, 2) → (8, 2)
+
+# --- 2) Stitch the left & right halves back into 4 × 4 ----------------
+W_left_hat  = X_hat[:4]           # first 4 rows   (cols 0-1)
+W_right_hat = X_hat[4:]           # last  4 rows   (cols 2-3)
+W_hat = np.hstack([W_left_hat, W_right_hat])
+
+# --- 3) Compare with the original ------------------------------------
+err  = W - W_hat                  # element-wise error
+rmse = np.sqrt((err**2).mean())   # root-mean-square error
+
+print("\nReconstructed Ŵ (4×4):\n", W_hat, "\n")
+print("Element-wise error (W − Ŵ):\n", err, "\n")
+print("RMSE =", rmse)
