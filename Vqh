@@ -1,0 +1,60 @@
+import numpy as np
+from sklearn.cluster import KMeans
+import math
+
+# ──────────────────────────────────────────
+# 1) 4 × 4 weight matrix (slide 29)
+# ──────────────────────────────────────────
+W = np.array([
+    [ 2.09, -0.98,  1.48,  0.09],
+    [ 0.05, -0.14,  1.08,  2.12],
+    [-0.91,  1.92, -1.02, -1.03],
+    [ 1.87,  0.00,  1.53,  1.49]
+], dtype=np.float32)
+
+print("W (4×4):\n", W, "\n")
+
+# ──────────────────────────────────────────
+# 2) Reshape → 8 × 2 (slide 30)
+#    split each row into two 2-D subvectors
+# ──────────────────────────────────────────
+left_cols  = W[:, :2]       # first two columns
+right_cols = W[:, 2:]       # last  two columns
+X = np.vstack([left_cols, right_cols])   # shape (8, 2)
+
+m, l = X.shape              # m = 8 sub-vectors, l = 2 dims
+print("X (8×2):\n", X, "\n")
+
+# ──────────────────────────────────────────
+# 3) K-means Vector Quantisation
+# ──────────────────────────────────────────
+k = 4                       # code-book size (2-bit index)
+print(f"k = {k}, m = {m}, l = {l}\n")
+
+kmeans = KMeans(n_clusters=k, n_init=10, random_state=0)
+labels   = kmeans.fit_predict(X)      # cluster indices (length m)
+centroid = kmeans.cluster_centers_    # k × l code-book
+
+print("Cluster index array:", labels)
+print("\nCentroid table (k×l):\n", centroid, "\n")
+
+# Arrange indices back to 4 × 2 for easy visual match (slides 32-36)
+cluster_idx_mat = labels.reshape(4, 2)
+print("Cluster index matrix (4×2):\n", cluster_idx_mat, "\n")
+
+# ──────────────────────────────────────────
+# 4) Simple compression stats (slide 37-style)
+# ──────────────────────────────────────────
+bits_per_weight = 32
+bits_per_index  = int(math.ceil(math.log2(k)))   # = 2 for k = 4
+
+original_bits   = W.size * bits_per_weight
+index_bits      = m * bits_per_index
+centroid_bits   = centroid.size * bits_per_weight
+compressed_bits = index_bits + centroid_bits
+compression     = original_bits / compressed_bits
+
+print(f"Original size      : {original_bits} bits")
+print(f"Compressed size    : {compressed_bits} bits "
+      f"(indices {index_bits}  +  centroids {centroid_bits})")
+print(f"Compression ratio  : {compression:.2f}×")
