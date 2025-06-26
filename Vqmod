@@ -1,0 +1,131 @@
+import numpy as np, math
+from scipy.cluster.vq import kmeans2, vq
+import matplotlib.pyplot as plt
+
+
+def vector_quantize(weights: np.ndarray,
+                    k: int = 8,
+                    subvec_cols: int = 2,
+                    init: str = "++",
+                    iterations: int = 25,
+                    random_state: int | None = None,
+                    plot: bool = False):
+    """
+    Generic Vector-Quantisation helper (k-means + VQ).
+
+    Parameters
+    ----------
+    weights : np.ndarray, shape (rows, cols)
+        Weight / feature matrix to compress.
+    k : int
+        Code-book size (number of centroids).
+    subvec_cols : int
+        Width of each sub-vector (must divide `cols`).
+    init : {"random", "++"}
+        Centroid seeding for SciPy k-means.
+    iterations : int
+        k-means max iterations.
+    random_state : int | None
+        Seed for reproducibility (affects NumPy + k-means).
+    plot : bool
+        If True **and** `subvec_cols==2`, shows a scatter of clusters.
+
+    Returns
+    -------
+    dict with keys:
+        centroids        – (k, subvec_cols) array
+        codes            – (rows*(cols/subvec_cols),) int array
+        reconstructed    – matrix of same shape as `weights`
+        rmse             – root-mean-square error
+        compression_bits – dict of {original, indices, centroids,
+                                     compressed, ratio}
+    """
+    if random_state is not None:
+        np.random.seed(random_state)
+
+    rows, cols = weights.shape
+    assert cols % subvec_cols == 0, "`cols` must be divisible by subvec_cols"
+
+    # 1️⃣  Flatten into (n_subvectors, subvec_cols)
+    n_subvectors = rows * (cols // subvec_cols)
+    X = weights.reshape(rows, -1, subvec_cols).reshape(n_subvectors, subvec_cols)
+
+    # 2️⃣  k-means ⇒ code-book (centroids) + codes
+    centroids, _ = kmeans2(X, k, minit=init, iter=iterations)
+    codes, _     = vq(X, centroids)
+
+    # 3️⃣  Reconstruct matrix
+    X_hat    = centroids[codes]
+    W_hat    = X_hat.reshape(rows, cols)
+    rmse     = float(np.sqrt(np.mean((W_hat - weights) ** 2)))
+
+    # 4️⃣  Bit-budget accounting (32-bit floats → log₂k-bit indices + centroids)
+    bits_per_weight = 32
+    bits_per_index  = int(math.ceil(math.log2(k)))
+    orig_bits       = weights.size * bits_per_weight
+    index_bits      = n_subvectors * bits_per_index
+    centroid_bits   = centroids.size * bits_per_weight
+    comp_bits       = index_bits + centroid_bits
+    ratio           = orig_bits / comp_bits
+    comp = dict(original=orig_bits, indices=index_bits, centroids=centroid_bits,
+                compressed=comp_bits, ratio=ratio)
+
+    # 5️⃣  Optional 2-D scatter plot
+    if plot and subvec_cols == 2:
+        plt.figure(figsize=(6, 5))
+        palette = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+        for idx in range(k):
+            pts = X[codes == idx]
+            plt.scatter(pts[:, 0], pts[:, 1],
+                        label=f"code {idx}",
+                        edgecolor="k", s=70,
+                        color=palette[idx % len(palette)])
+        plt.scatter(centroids[:, 0], centroids[:, 1],
+                    marker="x", s=120, linewidths=2,
+                    color="black", label="centroids")
+        plt.title(f"Vector Quantisation (k = {k})")
+        plt.xlabel("dimension 0")
+        plt.ylabel("dimension 1")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+    return dict(centroids=centroids,
+                codes=codes,
+                reconstructed=W_hat,
+                rmse=rmse,
+                compression_bits=comp)
+
+
+# ──────────────────────────────
+# Demo / self-test
+# ──────────────────────────────
+if __name__ == "__main__":
+    np.random.seed(42)
+    W_demo = np.random.uniform(-2, 2, size=(6, 6)).astype(np.float32)
+    res    = vector_quantize(W_demo, k=8, subvec_cols=2,
+                             random_state=0, plot=True)
+
+    print("\n=== Demo summary ===")
+    print("Original shape :", W_demo.shape)
+    print("Centroids:\n", res["centroids"])
+    print("First 12 codes:", res["codes"][:12], "…")
+    print("RMSE          :", res["rmse"])
+    print("Compression   :", res["compression_bits"])
+
+
+
+
+
+
+
+#######22222
+
+from vq_utils import vector_quantize   # if you save it as vq_utils.py
+
+W = np.random.randn(128, 64).astype(np.float32)  # any matrix
+result = vector_quantize(W, k=16, subvec_cols=4, random_state=123)
+
+compressed = result["reconstructed"]
+print("RMSE =", result["rmse"])
