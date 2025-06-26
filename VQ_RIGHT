@@ -1,0 +1,109 @@
+import numpy as np
+import math
+from scipy.cluster.vq import kmeans2, vq
+import matplotlib.pyplot as plt
+
+def main():
+    # ──────────────────────────────────────────
+    # 1) Original 4×4 weight matrix (slide 29)
+    # ──────────────────────────────────────────
+    W = np.array([
+        [ 2.09, -0.98,  1.48,  0.09],
+        [ 0.05, -0.14,  1.08,  2.12],
+        [-0.91,  1.92, -1.02, -1.03],
+        [ 1.87,  0.00,  1.53,  1.49]
+    ], dtype=np.float32)
+
+    print("# Original weights W (4×4)\n", W, "\n")
+
+    # ──────────────────────────────────────────
+    # 2) Reshape: split each row → two 2-D subvectors
+    #             yields an 8×2 matrix X (slide 30)
+    # ──────────────────────────────────────────
+    X = np.vstack([W[:, :2], W[:, 2:]])
+    print("# Reshaped sub-vector matrix X (8×2)\n", X, "\n")
+
+    # ──────────────────────────────────────────
+    # 3) k-means / VQ with SciPy  (k = 4 ⇒ 2-bit index)
+    # ──────────────────────────────────────────
+    k = 4
+    centroids, _ = kmeans2(X, k, minit='++', iter=25)  # code-book
+    codes, dist  = vq(X, centroids)                    # index per subvector
+
+    print("# Code-book centroids (k = 4)\n", centroids, "\n")
+    print("# Codes assigned to each sub-vector (length 8)\n", codes, "\n")
+
+    # ──────────────────────────────────────────
+    # 4) Pretty mapping table (which sub-vector got which code)
+    # ──────────────────────────────────────────
+    print("=== Sub-vector → Code mapping ===")
+    labels = ["row0-L", "row1-L", "row2-L", "row3-L",
+              "row0-R", "row1-R", "row2-R", "row3-R"]
+    for lab, vec, code in zip(labels, X, codes):
+        print(f"{lab:6}  {vec}  →  code {code}")
+    print()
+
+    # ──────────────────────────────────────────
+    # 5) Reconstruct Ŵ from indices + code-book
+    # ──────────────────────────────────────────
+    X_hat = centroids[codes]            # (8,2) reconstructed subvectors
+    W_hat = np.hstack([X_hat[:4],       # left halves
+                       X_hat[4:]])      # right halves
+
+    print("# Reconstructed Ŵ (4×4)\n", W_hat, "\n")
+
+    # ──────────────────────────────────────────
+    # 6) Error & RMSE
+    # ──────────────────────────────────────────
+    err  = W - W_hat
+    rmse = np.sqrt((err**2).mean())
+    print("# Element-wise error (W − Ŵ)\n", err, "\n")
+    print("RMSE =", rmse, "\n")
+
+    # ──────────────────────────────────────────
+    # 7) Tiny compression stat (à la slide 37)
+    # ──────────────────────────────────────────
+    bits_per_weight = 32
+    bits_per_index  = int(math.ceil(math.log2(k)))   # 2 bits for k=4
+
+    orig_bits       = W.size * bits_per_weight
+    index_bits      = X.shape[0] * bits_per_index
+    centroid_bits   = centroids.size * bits_per_weight
+    comp_bits       = index_bits + centroid_bits
+    comp_ratio      = orig_bits / comp_bits
+
+    print(f"# Compression: {orig_bits} bits → {comp_bits} bits "
+          f"(ratio ≈ {comp_ratio:.2f}×)")
+    print(f"  • indices  : {index_bits} bits "
+          f"({X.shape[0]} × {bits_per_index}-bit)")
+    print(f"  • centroids: {centroid_bits} bits "
+          f"({centroids.size} × 32-bit)\n")
+
+    # ──────────────────────────────────────────
+    # 8) Scatter plot of clusters + centroids
+    # ──────────────────────────────────────────
+    plt.figure(figsize=(6, 5))
+    colour_cycle = plt.rcParams['axes.prop_cycle'].by_key()['color']
+
+    for idx in range(k):
+        pts = X[codes == idx]
+        plt.scatter(pts[:, 0], pts[:, 1],
+                    label=f"code {idx}",
+                    edgecolor='k',
+                    s=70,
+                    color=colour_cycle[idx % len(colour_cycle)])
+
+    plt.scatter(centroids[:, 0], centroids[:, 1],
+                marker='x', s=120, linewidths=2, color='black',
+                label='centroids')
+
+    plt.title("Sub-vectors clustered by k-means (k = 4)")
+    plt.xlabel("dimension 0")
+    plt.ylabel("dimension 1")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+if __name__ == "__main__":
+    main()
