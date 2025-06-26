@@ -1,0 +1,146 @@
+import numpy as np, math
+from scipy.cluster.vq import kmeans2, vq as scipy_vq
+import matplotlib.pyplot as plt
+# ──────────────────────────────────────────
+# 1️⃣  Stage-1 : code-book + code assignment
+# ──────────────────────────────────────────
+def vq_encode(weights: np.ndarray,
+              k: int = 8,
+              subvec_cols: int = 2,
+              init: str = "++",
+              iterations: int = 25,
+              random_state: int | None = None):
+    """
+    Build a code-book (centroids) and assign an integer code to every
+    `subvec_cols`-wide sub-vector of `weights`.
+
+    Returns
+    -------
+    dict{centroids, codes, subvec_cols, original_shape}
+    """
+    if random_state is not None:
+        np.random.seed(random_state)
+
+    rows, cols = weights.shape
+    assert cols % subvec_cols == 0, "`cols` must be divisible by subvec_cols"
+
+    n_subvectors = rows * (cols // subvec_cols)
+    X = weights.reshape(rows, -1, subvec_cols).reshape(n_subvectors, subvec_cols)
+
+    centroids, _ = kmeans2(X, k, minit=init, iter=iterations)
+    codes, _     = scipy_vq(X, centroids)
+
+    return dict(centroids=centroids,
+                codes=codes,
+                subvec_cols=subvec_cols,
+                original_shape=weights.shape)
+
+# ──────────────────────────────────────────
+# 2️⃣  Stage-2 : reconstruction + analysis
+# ──────────────────────────────────────────
+def analyse_vq(weights: np.ndarray,
+               centroids: np.ndarray,
+               codes: np.ndarray,
+               subvec_cols: int,
+               plot: bool = False):
+    """
+    Reconstruct the quantised matrix, compute RMSE and bit-budget.
+    Optionally plot a 2-D scatter (only if subvec_cols == 2).
+
+    Returns
+    -------
+    dict{reconstructed, rmse, compression_bits}
+    """
+    rows, cols = weights.shape
+    n_subvectors = codes.size
+
+    # --- reconstruction ---
+    X_hat = centroids[codes]
+    W_hat = X_hat.reshape(rows, cols)
+
+    # --- error ---
+    rmse = float(np.sqrt(np.mean((weights - W_hat) ** 2)))
+
+    # --- compression maths ---
+    k = centroids.shape[0]
+    bits_per_weight = 32
+    bits_per_index  = int(math.ceil(np.log2(k)))
+    orig_bits       = weights.size * bits_per_weight
+    idx_bits        = n_subvectors * bits_per_index
+    cen_bits        = centroids.size * bits_per_weight
+    comp_bits       = idx_bits + cen_bits
+    comp            = dict(original=orig_bits,
+                           indices=idx_bits,
+                           centroids=cen_bits,
+                           compressed=comp_bits,
+                           ratio=orig_bits / comp_bits)
+
+    # --- optional visualisation (2-D only) ---
+    if plot and subvec_cols == 2:
+        X = weights.reshape(rows, -1, subvec_cols).reshape(n_subvectors, subvec_cols)
+        plt.figure(figsize=(6, 5))
+        colours = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+        for idx in range(k):
+            pts = X[codes == idx]
+            plt.scatter(pts[:, 0], pts[:, 1],
+                        label=f"code {idx}",
+                        edgecolor="k", s=70,
+                        color=colours[idx % len(colours)])
+        plt.scatter(centroids[:, 0], centroids[:, 1],
+                    marker="x", s=120, linewidths=2,
+                    color="black", label="centroids")
+        plt.title(f"VQ scatter (k={k})")
+        plt.xlabel("dimension 0")
+        plt.ylabel("dimension 1")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+    return dict(reconstructed=W_hat,
+                rmse=rmse,
+                compression_bits=comp)
+
+# ──────────────────────────────────────────
+# 🔎  Quick demo
+# ──────────────────────────────────────────
+if __name__ == "__main__":
+    np.random.seed(42)
+    W_demo = np.random.uniform(-2, 2, size=(6, 6)).astype(np.float32)
+
+    stage1 = vq_encode(W_demo, k=8, subvec_cols=2, random_state=0)
+    print("# Stage-1 outputs")
+    print("Centroids:\n", stage1["centroids"])
+    print("First 12 codes:", stage1["codes"][:12], "\n")
+
+    stage2 = analyse_vq(W_demo,
+                        centroids=stage1["centroids"],
+                        codes=stage1["codes"],
+                        subvec_cols=stage1["subvec_cols"],
+                        plot=True)
+    print("# Stage-2 summary")
+    print("RMSE:", stage2["rmse"])
+    print("Compression bits:", stage2["compression_bits"])
+
+
+
+
+
+
+
+
+###########
+testerrrr
+
+from vq_modular import vq_encode, analyse_vq       # if saved as vq_modular.py
+
+weights = np.load("conv2d_kernel.npy")             # any float matrix
+stage1  = vq_encode(weights, k=16, subvec_cols=4)
+stage2  = analyse_vq(weights,
+                     centroids=stage1["centroids"],
+                     codes=stage1["codes"],
+                     subvec_cols=stage1["subvec_cols"],
+                     plot=False)
+
+print("RMSE :", stage2["rmse"])
+print("Ratio:", stage2["compression_bits"]["ratio"], "×")
