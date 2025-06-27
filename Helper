@@ -1,0 +1,40 @@
+import torch
+from vq_modular import vq_encode, analyse_vq     # ← your module
+
+# 1️⃣  BUILD + LOAD ORIGINAL MODEL ------------------------------------------------
+model = MyCNNModel()
+model.load_state_dict(torch.load("cifar_net.pth", map_location="cpu"))
+model.eval()
+
+# 2️⃣  EXTRACT fc3 WEIGHT  (NumPy matrix) -----------------------------------------
+W = model.fc3.weight.detach().cpu().numpy()     # shape (out, in)
+
+# 3️⃣  QUANTISE -------------------------------------------------------------------
+enc = vq_encode(W, k=8, subvec_cols=2, random_state=0)  # tune args as you like
+centroids = enc["centroids"]
+codes     = enc["codes"]
+subvec    = enc["subvec_cols"]
+
+# 4️⃣  DE-QUANTISE  (rebuild matrix) ----------------------------------------------
+recon_W, rmse, comp_stats = analyse_vq(
+    W,
+    centroids=centroids,
+    codes=codes,
+    subvec_cols=subvec,
+    plot=False            # skip scatter visual
+)
+
+print(f"Reconstruction RMSE: {rmse:.6f}")
+print("Compression bits:", comp_stats)
+
+# 5️⃣  PUT REBUILT WEIGHT BACK INTO MODEL -----------------------------------------
+with torch.no_grad():
+    model.fc3.weight.copy_(
+        torch.tensor(recon_W,
+                     dtype=model.fc3.weight.dtype,
+                     device=model.fc3.weight.device)
+    )
+
+# 6️⃣  (optional) SAVE UPDATED CHECKPOINT -----------------------------------------
+torch.save(model.state_dict(), "cifar_net_fc3_roundtrip.pth")
+print("Updated model saved → cifar_net_fc3_roundtrip.pth")
