@@ -1,0 +1,94 @@
+import torch
+import torchvision
+import torchvision.transforms as transforms
+
+# 1. Load model
+print("Loading model from 'org.pth'...")
+model = ...  # define small CNN architecture for CIFAR-10
+model.load_state_dict(torch.load('org.pth'))
+model.eval()
+
+# 2. Prepare data loader for a small batch of validation images
+print("Preparing CIFAR-10 validation data...")
+transform = transforms.Compose([transforms.ToTensor()])
+valset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
+valloader = torch.utils.data.DataLoader(valset, batch_size=32, shuffle=False)
+data_iter = iter(valloader)
+images, labels = next(data_iter)  # one batch
+images = images  # shape: [32, 3, 32, 32]
+
+# 3. Forward pass and collect activations for fc3 input
+print("Collecting activations from fc2 (input to fc3)...")
+activations = []
+def hook_fn(module, input, output):
+    activations.append(input[0].detach())
+# Assume `fc3` is the last fully connected layer
+hook = model.fc3.register_forward_hook(hook_fn)
+with torch.no_grad():
+    _ = model(images)
+hook.remove()
+# activations[0] has shape [batch, in_features] for fc3 input
+X = activations[0]  # tensor [N, D]
+print(f" - Collected activation matrix X of shape {X.shape}")
+
+# 4. Compute Hessian proxy (X X^T) and its inverse diagonal
+print("Computing Hessian proxy XX^T...")
+# Shape X: [N, D] where D = in_features of fc3
+X = X.transpose(0,1)  # shape [D, N]
+H_proxy = X @ X.t()   # shape [D, D]
+# Add small identity to avoid singularity
+eps = 1e-5
+H_proxy += eps * torch.eye(H_proxy.size(0))
+H_inv = torch.linalg.pinv(H_proxy)
+hessian_diag = torch.diag(H_inv)  # vector of length D
+print(" - Hessian proxy (diag) computed.")
+
+# 5. Compute channel importance scores
+print("Computing channel importance (quantization error * Hessian)...")
+W = model.fc3.weight.data.clone()  # shape [out_features, in_features]
+# For 8-bit symmetric quantization, compute scale
+W_max = W.abs().max()
+scale = (2**7 - 1) / W_max
+# Quantize weights to 8-bit integers then dequantize
+W_int = torch.clamp((W * scale).round(), -127, 127)
+W_q = W_int.float() / scale
+# Squared error per weight
+error = (W - W_q) ** 2  # shape [out, in]
+# Channel error: take max over all outputs for each input channel
+err_channel, _ = error.max(dim=0)  # length = in_features
+# Importance I_i = err_channel[i] * hessian_diag[i]
+importance = err_channel * hessian_diag
+print(" - Computed importance for each channel.")
+
+# 6. Select and reorder channels by importance
+print("Selecting and reordering top channels...")
+# Determine number of important channels (e.g. top 5% if desired)
+lambda_ratio = 0.05
+num_channels = importance.numel()
+k = max(1, int(num_channels * lambda_ratio))
+# Sort channels by importance
+importance_sorted, idx = importance.sort(descending=True)
+topk_idx = idx[:k]
+print(f" - Identified top {k}/{num_channels} important channels.")
+# Reorder columns of weight: move critical channels to front
+_, perm = importance.sort(descending=True)
+W_reordered = W[:, perm]  # columns permuted by importance
+print(" - Channels reordered by importance.")
+
+# 7. Quantize the reordered weights (already done above, reuse W_q in new order)
+# Re-apply quantization on reordered weights for completeness
+W_reordered_int = torch.clamp((W_reordered * scale).round(), -127, 127)
+W_reordered_q = W_reordered_int.float() / scale
+print("Quantizing reordered weights to 8-bit...")
+
+# 8. Restore original channel order
+inv_perm = torch.argsort(perm)
+W_quant = W_reordered_q[:, inv_perm]
+# Update model weights
+model.fc3.weight.data.copy_(W_quant)
+print(" - Quantized weights assigned to fc3 (original channel order restored).")
+
+# 9. Save the quantized model
+print("Saving quantized model to 'finetunedorg.pth'...")
+torch.save(model.state_dict(), 'finetunedorg.pth')
+print("Done. Model saved.")
