@@ -1,0 +1,172 @@
+import torch import torch.nn as nn import torch.nn.functional as F from typing import List, Tuple
+
+###############################################
+
+Utility helpers
+
+###############################################
+
+def partition_weights_to_vectors(W: torch.Tensor, d: int) -> torch.Tensor: """Flattens weight matrix and reshapes into N x d vectors (truncates remainder).""" flat = W.flatten() usable = (flat.numel() // d) * d if usable == 0: return flat.view(1, -1)  # edge‑case fallback return flat[:usable].view(-1, d)
+
+def restore_vectors_to_weights(vectors: torch.Tensor, shape: Tuple[int, ...]) -> torch.Tensor: """Inverse of partition_weights_to_vectors (pads with zeros if needed).""" flat = vectors.flatten() total = torch.prod(torch.tensor(shape)).item() if flat.numel() < total: pad = torch.zeros(total - flat.numel(), device=flat.device, dtype=flat.dtype) flat = torch.cat([flat, pad]) return flat.view(*shape)
+
+###############################################
+
+Simple K‑means in PyTorch (Lloyd’s)
+
+###############################################
+
+def kmeans_torch(X: torch.Tensor, k: int, iters: int = 20, seed: int = 0) -> torch.Tensor: torch.manual_seed(seed) # random init perm = torch.randperm(X.size(0), device=X.device) C = X[perm[:k]].clone()  # k x d for _ in range(iters): dists = torch.cdist(X, C)               # n x k labels = dists.argmin(dim=1)            # n # update for i in range(k): sel = labels == i if sel.any(): C[i] = X[sel].mean(dim=0) return C.detach()
+
+###############################################
+
+Core CRVQ primitives
+
+###############################################
+
+def prequantize(W: torch.Tensor, codebook_bits: int = 8) -> torch.Tensor: """Quick scalar quantization (uniform) used only for importance estimation.""" n_steps = 2 ** codebook_bits - 1 scale = W.abs().max() / n_steps return torch.round(W / scale) * scale
+
+def compute_importance(W: torch.Tensor, Wq: torch.Tensor, XXT: torch.Tensor) -> torch.Tensor: # channel‑wise maximum squared error diff2 = (W - Wq) ** 2 max_err = diff2.max(dim=0).values  # per column # Hessian proxy diagonal inverse eps = 1e-6 h_inv_diag = 1.0 / (XXT.diag() + eps) # match shapes (broadcast if needed) h_inv_diag = F.pad(h_inv_diag, (0, max_err.size(0) - h_inv_diag.size(0))) return 0.5 * max_err * h_inv_diag
+
+def reorder_channels(W: torch.Tensor, I: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]: idx = torch.argsort(I, descending=True) return W[:, idx], idx
+
+def vector_quantize(vectors: torch.Tensor, codebook: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]: dists = torch.cdist(vectors, codebook)  # n x k enc = dists.argmin(dim=1) return codebook[enc], enc
+
+def compute_error(orig: torch.Tensor, quant: torch.Tensor) -> torch.Tensor: return orig - quant
+
+def update_quant(quant: torch.Tensor, residual_quant: torch.Tensor) -> torch.Tensor: return quant + residual_quant
+
+def quant_loss(W: torch.Tensor, Wq: torch.Tensor, X: torch.Tensor) -> torch.Tensor: return ((W @ X) - (Wq @ X)).pow(2).sum()
+
+###############################################
+
+CRVQ Quantizer Class
+
+###############################################
+
+class CRVQQuantizer: def init(self, m_codebooks: int = 4, lambda_ratio: float = 0.02, e_bits: int = 8, d_dim: int = 8, eps_loss: float = 1e-2, kmeans_iters: int = 20, device: str = "cpu"): self.m = m_codebooks self.lambda_ratio = lambda_ratio self.e_bits = e_bits self.d = d_dim self.eps_loss = eps_loss self.kmeans_iters = kmeans_iters self.device = device
+
+##########################
+# public API             #
+##########################
+
+def quantize_model(self, model: nn.Module, X_calib: torch.Tensor):
+    """Walks through Linear layers and applies CRVQ."""
+    model = model.to(self.device)
+    X_calib = X_calib.to(self.device)
+    XXT_global = X_calib @ X_calib.T
+    for name, mod in model.named_modules():
+        if isinstance(mod, nn.Linear):
+            print(f"\n[CRVQ] Processing layer: {name}, weight shape={mod.weight.shape}")
+            self._quantize_weight(mod.weight, X_calib, XXT_global)
+    return model
+
+##########################
+# internal helpers       #
+##########################
+
+def _quantize_weight(self, W_param: nn.Parameter, X: torch.Tensor, XXT: torch.Tensor):
+    W = W_param.data  # shape: out x in
+    print("  Step 3: Pre‑quantization …")
+    W_pre = prequantize(W, self.e_bits)
+
+    print("  Step 4: Compute importance …")
+    I = compute_importance(W, W_pre, XXT)
+
+    print("  Step 5: Reorder channels …")
+    W_sorted, idx_map = reorder_channels(W, I)
+
+    # Partition into vectors
+    vectors = partition_weights_to_vectors(W_sorted, self.d)
+    print(f"     partitioned into {vectors.size(0)} vectors of dim={self.d}")
+
+    # === Basic codebook ===
+    k = 2 ** self.e_bits
+    print("  Step 6: Train basic codebook …")
+    C_base = kmeans_torch(vectors, k, self.kmeans_iters)
+
+    print("  Step 7: Vector quantization (base) …")
+    vq_base, B_base = vector_quantize(vectors, C_base)
+    Wq_base = restore_vectors_to_weights(vq_base, W_sorted.shape)
+
+    # Identify critical channels
+    num_ch = W_sorted.size(1)
+    num_lambda = max(1, int(num_ch * self.lambda_ratio)) if self.m > 1 else 0
+    lambda_cols = torch.arange(num_lambda)
+    other_cols  = torch.arange(num_lambda, num_ch)
+
+    # Containers for later fine‑tuning
+    C_ext_list: List[torch.Tensor] = []
+    B_ext_list: List[torch.Tensor] = []
+    Wq_lambda = Wq_base[:, lambda_cols].clone()
+
+    # === Extended codebooks ===
+    for t in range(1, self.m):
+        print(f"  Extended codebook {t}/{self.m-1} …")
+        # build error vectors only for lambda channels
+        W_lambda = W_sorted[:, lambda_cols]
+        vec_lambda = partition_weights_to_vectors(W_lambda, self.d)
+        vec_lambda_q = partition_weights_to_vectors(Wq_lambda, self.d)
+        residual = compute_error(vec_lambda, vec_lambda_q)
+
+        C_ext = kmeans_torch(residual, k, self.kmeans_iters)
+        residual_q, B_ext = vector_quantize(residual, C_ext)
+        residual_q_mat = restore_vectors_to_weights(residual_q, W_lambda.shape)
+
+        # additive update
+        Wq_lambda = update_quant(Wq_lambda, residual_q_mat)
+
+        C_ext_list.append(C_ext)
+        B_ext_list.append(B_ext)
+
+    # Stitch final Wq
+    Wq_final = Wq_base.clone()
+    if num_lambda:
+        Wq_final[:, lambda_cols] = Wq_lambda
+
+    # loss & simple fine‑tune loop (placeholder)
+    loss = quant_loss(W_sorted, Wq_final, X)
+    print(f"  Initial quant loss={loss.item():.4e}")
+    it = 0
+    while loss > self.eps_loss and it < 3:
+        # naive scale fine‑tune demo
+        Wq_final *= 0.95
+        loss = quant_loss(W_sorted, Wq_final, X)
+        print(f"    Fine‑tune iter {it+1}: loss={loss.item():.4e}")
+        it += 1
+
+    # restore original channel order
+    inv_idx = torch.argsort(idx_map)
+    Wq_reordered = Wq_final[:, inv_idx]
+
+    # write back
+    W_param.data.copy_(Wq_reordered)
+    print("  >>> weight quantization complete. Final loss=", loss.item())
+
+###############################################
+
+Simple demo network
+
+###############################################
+
+class TinyMLP(nn.Module): def init(self): super().init() self.fc1 = nn.Linear(128, 256) self.fc2 = nn.Linear(256, 128) def forward(self, x): x = F.relu(self.fc1(x)) return self.fc2(x)
+
+###############################################
+
+Example usage
+
+###############################################
+
+def example(): torch.manual_seed(42) model = TinyMLP() # calibration data: 512 samples X_calib = torch.randn(256, 128)
+
+quantizer = CRVQQuantizer(m_codebooks=4, lambda_ratio=0.02, e_bits=8, d_dim=8, eps_loss=1e-2)
+model_q = quantizer.quantize_model(model, X_calib.T)  # note: shape in x should match W.T
+
+# quick sanity‑check inference
+inp = torch.randn(4, 128)
+with torch.no_grad():
+    out = model_q(inp)
+print("\nInference output (first sample):", out[0][:8])
+
+if name == "main": example()
+
