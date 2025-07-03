@@ -1,0 +1,222 @@
+PyTorch Implementations of CRVQ Steps 15, 16, 19, and 21
+
+Below we implement the CRVQ Algorithm 1 steps 15, 16, 19, and 21 in PyTorch, assuming a small CNN (with 2 FC layers) and MNIST calibration data. We target the FC layers for quantization. In each function, X_calib or calib_loader refers to a small batch of MNIST validation inputs (and labels for fine-tuning steps). We also assume existing codebooks and assignment indices (B_base, B_exts) for each quantized weight matrix. The code is designed to be modular and fit into a larger CRVQ quantization loop.
+
+Step 15: FineTuneCodebook
+
+We treat the base and extended codebook vectors as trainable parameters and optimize them to minimize the calibration loss. Specifically, for a given weight matrix W and its current code assignments, we compute the quantized weight W_q = C_base[B_base] + Σ C_ext[t][B_exts[t]], then minimize the Frobenius norm of (W - W_q) @ X_calib. This corresponds to Algorithm 1 step 15. In practice, we run a few gradient steps (e.g. using Adam) on the codebook tensors. Key steps:
+
+Compute quantized weight W_q by summing the selected codebook vectors.
+
+Compute calibration loss L = ||(W - W_q) X_calib||².
+
+Backpropagate and update C_base and all C_ext[t] via an optimizer.
+
+
+import torch
+
+def fine_tune_codebook(C_base, C_exts, W, B_base, B_exts, X_calib, lr=1e-4, steps=100):
+    """
+    Fine-tunes base and extended codebooks on calibration data.
+    Args:
+        C_base (Tensor): Base codebook tensor of shape (K_base, code_dim).
+        C_exts (list[Tensor]): List of extended codebooks, each of shape (K_ext_t, code_dim).
+        W (Tensor): Original weight matrix (out_features x in_features).
+        B_base (LongTensor): Base assignment indices of shape (out_features,).
+        B_exts (list[LongTensor]): Extended assignment indices for each ext codebook (same length as C_exts).
+        X_calib (Tensor): Calibration input data. Shape should be (in_features, batch_size).
+        lr (float): Learning rate for codebook updates.
+        steps (int): Number of optimization steps.
+    Returns:
+        C_base_new, C_exts_new: Updated codebook tensors (detached).
+    """
+    # Ensure calibration data is (in_features x batch_size)
+    # If X_calib is (batch_size x in_features), transpose it:
+    if X_calib.ndim == 2 and X_calib.shape[0] < X_calib.shape[1]:
+        X_calib = X_calib.T
+
+    # Make codebooks into trainable parameters
+    C_base_param = C_base.clone().detach().requires_grad_(True)
+    C_ext_params = [C.clone().detach().requires_grad_(True) for C in C_exts]
+    
+    optimizer = torch.optim.Adam([C_base_param] + C_ext_params, lr=lr)
+    W_orig = W.clone().detach()  # Original weight (fixed target)
+
+    for _ in range(steps):
+        optimizer.zero_grad()
+        # Compute quantized weight W_q = C_base[B_base] + sum_t C_exts[t][B_exts[t]]
+        W_q = C_base_param[B_base]  # shape (out_features, in_features)
+        for t, C_param in enumerate(C_ext_params):
+            W_q = W_q + C_param[B_exts[t]]
+        # Compute calibration loss: Frobenius norm of (W_orig - W_q) @ X_calib
+        diff = (W_orig - W_q) @ X_calib  # shape (out_features, batch_size)
+        loss = torch.sum(diff * diff)    # ||(W_orig - W_q) X_calib||^2
+        loss.backward()
+        optimizer.step()
+    # Detach and return updated codebooks
+    return C_base_param.detach(), [C.detach() for C in C_ext_params]
+
+Step 16: BeamSearchOptimize
+
+In this step, we search for better code assignments that reduce the quantization error. We iterate over each output vector (row) of W, and for each row we try alternative base/extended code indices to see if the calibration error decreases. A simple greedy (beam) search is: for each row i, evaluate replacing its base code or any extended code with all possibilities, and keep the change if it lowers the loss. Key steps:
+
+For each row i of W, compute current error || (W[i] - W_q[i]) @ X_calib ||^2.
+
+Try each possible base-code index and extended-code index for this row, recompute the error, and pick the combination that minimizes the error.
+
+Update B_base[i] and B_exts[t][i] accordingly if an improvement is found.
+
+
+def beam_search_optimize(W, C_base, C_exts, B_base, B_exts, X_calib):
+    """
+    Attempts to improve code assignments via a beam-search-like greedy update.
+    Args:
+        W (Tensor): Original weight matrix (out_features x in_features).
+        C_base (Tensor): Base codebook (K_base x code_dim).
+        C_exts (list[Tensor]): List of extended codebooks.
+        B_base (LongTensor): Current base assignments (out_features,).
+        B_exts (list[LongTensor]): Current ext assignments for each extended codebook.
+        X_calib (Tensor): Calibration input (in_features x batch_size).
+    Returns:
+        (B_base_new, B_exts_new): Updated assignments (clones of input arrays).
+    """
+    if X_calib.ndim == 2 and X_calib.shape[0] < X_calib.shape[1]:
+        X_calib = X_calib.T
+
+    B_base_new = B_base.clone()
+    B_exts_new = [B.clone() for B in B_exts]
+    W_orig = W.clone().detach()
+
+    out_features = W.size(0)
+    for i in range(out_features):
+        # Current best codes and error for row i
+        base_idx = B_base_new[i].item()
+        ext_idxs = [B_exts_new[t][i].item() for t in range(len(C_exts))]
+        # Compute current quantized row vector
+        Wq_row = C_base[base_idx].clone()
+        for t, C in enumerate(C_exts):
+            Wq_row += C[ext_idxs[t]]
+        diff = (W_orig[i] - Wq_row) @ X_calib  # shape (batch_size,)
+        best_error = (diff * diff).sum().item()
+        best_base, best_exts = base_idx, list(ext_idxs)
+
+        # Try all base code alternatives
+        for k in range(C_base.size(0)):
+            Wq_candidate = C_base[k].clone()
+            for t, C in enumerate(C_exts):
+                Wq_candidate += C[best_exts[t]]
+            diff = (W_orig[i] - Wq_candidate) @ X_calib
+            error = (diff * diff).sum().item()
+            if error < best_error:
+                best_error = error
+                best_base = k
+        
+        B_base_new[i] = best_base
+
+        # Try all extended code alternatives (one codebook at a time)
+        for t, C in enumerate(C_exts):
+            current_ext = best_exts[t]
+            for k in range(C.size(0)):
+                if k == current_ext:
+                    continue
+                Wq_candidate = C_base[B_base_new[i]].clone()
+                # add other ext codes
+                for u, C_u in enumerate(C_exts):
+                    if u == t:
+                        Wq_candidate += C[k]  # try new code for this codebook
+                    else:
+                        Wq_candidate += C_u[best_exts[u]]
+                diff = (W_orig[i] - Wq_candidate) @ X_calib
+                error = (diff * diff).sum().item()
+                if error < best_error:
+                    best_error = error
+                    best_exts[t] = k
+        # Update extended assignments for row i
+        B_exts_new = [B_ext.clone() for B_ext in B_exts_new] if False else B_exts_new
+        for t in range(len(C_exts)):
+            B_exts_new[t][i] = best_exts[t]
+    return B_base_new, [B_ext.clone() for B_ext in B_exts_new]
+
+Step 19: FineTuneBlock
+
+After quantizing the current block of layers Bi, we fine-tune those layers using calibration data. We freeze all other layers and perform a few SGD updates on the block’s weights to minimize the task loss (e.g. cross-entropy on MNIST labels). This is akin to a short quantization-aware training phase for the block. Key steps:
+
+Freeze all parameters outside the current block Bi.
+
+Set up an optimizer (e.g. SGD) over the block’s parameters only.
+
+Run a few epochs on the calibration loader: forward the whole model, compute loss, backpropagate, and update the block weights.
+
+
+import torch.nn as nn
+
+def fine_tune_block(model, block_layers, calib_loader, lr=1e-3, epochs=5):
+    """
+    Fine-tunes the specified block layers using calibration data.
+    Args:
+        model (nn.Module): The full model.
+        block_layers (list[nn.Module]): List of layers in the current block to train.
+        calib_loader (DataLoader): Loader for (inputs, labels) from calibration data.
+        lr (float): Learning rate for fine-tuning.
+        epochs (int): Number of epochs over calibration data.
+    """
+    # Freeze all parameters
+    for param in model.parameters():
+        param.requires_grad = False
+    # Unfreeze block parameters
+    block_params = []
+    for layer in block_layers:
+        for param in layer.parameters():
+            param.requires_grad = True
+            block_params.append(param)
+    optimizer = torch.optim.SGD(block_params, lr=lr)
+    criterion = nn.CrossEntropyLoss()
+
+    model.train()
+    for _ in range(epochs):
+        for X_batch, y_batch in calib_loader:
+            # Forward pass through the entire model
+            outputs = model(X_batch)
+            loss = criterion(outputs, y_batch)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+    # (Optionally) re-freeze block parameters after fine-tuning
+    for param in block_params:
+        param.requires_grad = False
+
+Step 21: E2E_FineTune
+
+Finally, we optionally fine-tune the entire quantized model end-to-end using calibration data. This is a few epochs of full-model quantization-aware training to correct residual errors. We unfreeze all parameters and train normally on the calibration loader. Key steps:
+
+Unfreeze all model parameters (quantized weights).
+
+Run SGD (or Adam) over the full model for several epochs on (X_batch, y_batch).
+
+
+def e2e_fine_tune(model, calib_loader, lr=1e-3, epochs=5):
+    """
+    Fine-tunes the entire quantized model using calibration data.
+    Args:
+        model (nn.Module): The quantized model.
+        calib_loader (DataLoader): Loader for (inputs, labels) from calibration data.
+        lr (float): Learning rate for fine-tuning.
+        epochs (int): Number of epochs.
+    """
+    # Unfreeze all parameters
+    for param in model.parameters():
+        param.requires_grad = True
+    optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss()
+
+    model.train()
+    for _ in range(epochs):
+        for X_batch, y_batch in calib_loader:
+            outputs = model(X_batch)
+            loss = criterion(outputs, y_batch)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+Sources: These implementations follow the CRVQ Algorithm 1 specification, adapting standard vector-quantization techniques (e.g. codebook updates via gradient descent and beam search over code assignments) and widely-used fine-tuning practices. The calibration loss is computed as ‖(W – W_q)X_calib‖², and SGD/Adam steps are used to adjust codebooks or weights accordingly.
+
