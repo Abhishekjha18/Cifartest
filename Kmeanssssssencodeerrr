@@ -1,0 +1,30 @@
+from scipy.cluster.vq import kmeans2, vq as scipy_vq
+
+def vq_encode(vectors: np.ndarray, k: int,
+              iterations: int = 20,
+              random_state: int | None = None):
+    """
+    Return (centroids, codes) where
+      • centroids : (k_eff , d)   float32
+      • codes     : (N     ,)     int32
+    Handles tiny N by setting k_eff = min(k, N) (never > #samples).
+    """
+    # ensure 2-D
+    if vectors.ndim != 2:
+        vectors = vectors.reshape(-1, vectors.size)
+    N, d = map(int, vectors.shape)          # cast to plain ints
+    k_eff = min(k, N) if N > 0 else 1
+
+    if random_state is not None:
+        np.random.seed(random_state)
+
+    # k-means++ initialisation, SciPy expects float64
+    centroids, labels = kmeans2(
+        vectors.astype(np.float64),
+        k_eff,
+        minit='++',
+        iter=iterations)
+
+    codes = labels.astype(np.int32)
+    centroids = centroids.astype(vectors.dtype)
+    return centroids, codes
