@@ -1,0 +1,14 @@
+def compression_ratio(O:int, I:int, d:int, e:int, m:int, lam:float):
+-    bits_per_weight = (e/d) + ((m-1)*lam*e/d) + ((2**e - 16)/(m*d))
+-    return 16/bits_per_weight, bits_per_weight
++    n_vec_base = (O * I) // d
++    base_idx_bits = n_vec_base * e
++
++    n_vec_ext = int(lam * I) * O // d
++    ext_idx_bits = (m - 1) * n_vec_ext * e
++
++    codebook_bits = m * (2 ** e) * d * 16   # FP16 storage
++
++    total_bits = base_idx_bits + ext_idx_bits + codebook_bits
++    avg_bits = total_bits / (O * I)
++    return 16 / avg_bits, avg_bits
