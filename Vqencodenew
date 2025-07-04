@@ -1,0 +1,28 @@
+# ------------------------------------------------------------------ #
+#  Robust VQ encode  (scipy.cluster.vq.kmeans2 wrapper)              #
+# ------------------------------------------------------------------ #
+def vq_encode(vectors: np.ndarray, k: int,
+              iterations: int = 20, random_state: int | None = None):
+    """
+    Return (centroids, codes) where
+      • centroids shape = (k_eff, d)  (k_eff <= k)
+      • codes      shape = (N,)  int32   (indices into centroids)
+    Handles corner-cases: N < k  or  N == 1  by reducing k_eff.
+    """
+    if vectors.ndim != 2:
+        vectors = vectors.reshape(-1, vectors.size)  # ensure 2-D
+    n_vec, d = vectors.shape
+    k_eff = min(k, n_vec) if n_vec else 1          # never > #samples
+    if random_state is not None:
+        np.random.seed(random_state)
+
+    # scipy kmeans2
+    centroids, labels = kmeans2(
+        vectors.astype(np.float64),  # kmeans2 likes float64
+        k_eff,
+        minit='++',
+        iter=iterations
+    )
+    # quantise
+    codes = labels.astype(np.int32)
+    return centroids.astype(vectors.dtype), codes
