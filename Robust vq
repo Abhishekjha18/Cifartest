@@ -1,0 +1,19 @@
+-    n_vec, d = vectors.shape
+-    k_eff = min(k, n_vec) if n_vec else 1
++    n_vec, d = vectors.shape
++    n_vec = int(n_vec)                       # cast → plain int
++    k_eff = min(k, n_vec) if n_vec > 0 else 1
+
+
+
+- C_base, B_base = vq_encode(V_sorted, 2**self.e)
+- Vq_base, B_base = vq_decode(V_sorted, C_base)   # <-- wrong order + unpack
++ C_base, B_base = vq_encode(V_sorted, 2 ** self.e)
++ Vq_base        = vq_decode(C_base, B_base)      # 1-output decode
+
+
+
+- C_ext, B_ext = vq_encode(resid, 2**self.e, random_state=_)
+- Rq           = vq_decode(C_ext, B_ext)          # <-- keep
++ C_ext, B_ext = vq_encode(resid, 2 ** self.e, random_state=_)
++ Rq           = vq_decode(C_ext, B_ext)
