@@ -1,0 +1,80 @@
+# ------------------------------------------------------------------ #
+#  Classic vector-quantisation helpers (codebook + index book)       #
+# ------------------------------------------------------------------ #
+def vq_encode(vectors: np.ndarray, k: int,
+              iterations: int = 20, random_state: int | None = None):
+    """Return (centroids, codes) – k-means + scipy.vq assignment."""
+    if random_state is not None:
+        np.random.seed(random_state)
+    centroids, _ = kmeans2(vectors, k, minit='++', iter=iterations)
+    codes, _     = scipy_vq(vectors, centroids)
+    return centroids.astype(vectors.dtype), codes.astype(np.int32)
+
+def vq_decode(centroids: np.ndarray, codes: np.ndarray):
+    """Reconstruct vectors from centroids[ codes ]."""
+    return centroids[codes]
+
+
+
+
+
+
+main
+# OLD
+# from modules import (partition_to_vectors, …, kmeans_codebook, vector_quantize, …)
+# NEW
+from modules import (
+    partition_to_vectors, reassemble_from_vectors,
+    vq_encode, vq_decode,              #  ← use new helpers
+    importance_metric, reorder_channels, restore_order,
+    beam_search_iterative, compression_ratio)
+
+
+
+# old:
+# C_base = kmeans_codebook(V_sorted, 2**self.e)
+# Vq_base, B_base = vector_quantize(V_sorted, C_base)
+
+# new:
+C_base, B_base = vq_encode(V_sorted, 2**self.e)
+Vq_base        = vq_decode(C_base, B_base)
+
+
+
+
+
+# old:
+# C_base = kmeans_codebook(V_sorted, 2**self.e)
+# Vq_base, B_base = vector_quantize(V_sorted, C_base)
+
+# new:
+C_base, B_base = vq_encode(V_sorted, 2**self.e)
+Vq_base        = vq_decode(C_base, B_base)
+
+
+# old:
+# C_ext = kmeans_codebook(resid, 2**self.e)
+# Vq_ext, B_ext = vector_quantize(resid, C_ext)
+
+# new:
+C_ext, B_ext = vq_encode(resid, 2**self.e, random_state=_)
+Vq_ext       = vq_decode(C_ext, B_ext)
+
+
+
+
+
+def _recon(C_list, B_list):
+    v = vq_decode(C_list[0], B_list[0])
+    for C, B in zip(C_list[1:], B_list[1:]):
+        v += vq_decode(C, B)
+    return v
+
+
+
+
+
+import os, logging, importlib.util, argparse, torch, os   # os is used twice; harmless
+...
+# right after parsing args:
+os.makedirs(args.out_dir, exist_ok=True)   # ← ensures output directory exists
