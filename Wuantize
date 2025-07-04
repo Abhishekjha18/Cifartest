@@ -1,0 +1,27 @@
+# ─────────────────────────────────────────────────────────── #
+# Steps 8-13  extended codebooks applied to λ-fraction vectors
+# ─────────────────────────────────────────────────────────── #
+v_per_row = I // self.d                      # #sub-vectors per output row
+if v_per_row == 0:                           # layer too narrow for VQ
+    log.warning(f"Layer {name}: in_features({I}) < d({self.d}); "
+                "skipping CRVQ on this layer.")
+    return torch.tensor(Wnp, dtype=W.dtype)  # leave weights unchanged
+
+n_vectors = V_sorted.shape[0]                # total sub-vectors
+crit_rows = max(1, int(self.lam * O))        # important rows
+crit_vecs = min(crit_rows * v_per_row, n_vectors)
+idx_crit  = np.arange(crit_vecs)             # safe slice ≤ n_vectors
+
+if crit_vecs > 0:
+    for _ in range(self.m - 1):
+        resid = V_sorted[idx_crit] - _recon(C_list, B_list)[idx_crit]
+        if np.mean(resid**2) < self.eps:
+            break
+        C_ext, B_ext = vq_encode(resid, 2 ** self.e, random_state=_)
+        Vq_ext       = vq_decode(C_ext, B_ext)
+
+        fill_codes = np.zeros_like(B_base)
+        fill_codes[idx_crit] = B_ext
+        C_list.append(C_ext)
+        B_list.append(fill_codes)
+# ─────────────────────────────────────────────────────────── #
