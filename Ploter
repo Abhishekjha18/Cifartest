@@ -1,0 +1,113 @@
+#!/usr/bin/env python
+"""
+plot_crvq_results.py
+====================
+Read crvq_analysis_results.csv (produced by analysis.py) and emit helpful PNG
+charts:
+
+    • accuracy-vs-compression (No-FT, Block-FT, E2E-FT)
+    • accuracy-drop-vs-lambda
+    • accuracy-after-E2E-FT vs m, d, e     (one subplot per hyper-parameter)
+
+Invoke:  python plot_crvq_results.py  [--csv path] [--out plots]
+
+Author: you
+"""
+import argparse, os
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns     # pretty default styling; stdlib OK
+
+def load_dataframe(csv_path: str) -> pd.DataFrame:
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"CSV '{csv_path}' not found.")
+    df = pd.read_csv(csv_path)
+    # ensure numeric columns are floats
+    num_cols = ["baseline_acc", "no_ft_acc", "block_ft_acc", "e2e_ft_acc",
+                "accuracy_drop", "model_comp"]
+    for c in num_cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+def ensure_dir(path: str):
+    if not os.path.isdir(path):
+        os.makedirs(path, exist_ok=True)
+
+def plot_acc_vs_compression(df: pd.DataFrame, outdir: str):
+    plt.figure(figsize=(8,6))
+    plt.scatter(df["model_comp"], df["no_ft_acc"],
+                c="crimson", marker="x", label="No FT")
+    plt.scatter(df["model_comp"], df["block_ft_acc"],
+                c="darkorange", marker="^", label="Block FT")
+    plt.scatter(df["model_comp"], df["e2e_ft_acc"],
+                c="steelblue", marker="o", label="E2E FT")
+    plt.xlabel("Compression ratio (×)")
+    plt.ylabel("Accuracy (%)")
+    plt.title("Accuracy vs. Compression")
+    plt.grid(True, linestyle="--", alpha=0.5)
+    plt.legend()
+    fn = os.path.join(outdir, "accuracy_vs_compression.png")
+    plt.savefig(fn, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Saved {fn}")
+
+def plot_accdrop_vs_lambda(df: pd.DataFrame, outdir: str):
+    plt.figure(figsize=(7,5))
+    sns.boxplot(x="lambda", y="accuracy_drop", data=df,
+                palette="Blues", showmeans=True)
+    plt.ylabel("Accuracy drop (baseline − no-FT)")
+    plt.title("Accuracy drop vs. λ")
+    fn = os.path.join(outdir, "accdrop_vs_lambda.png")
+    plt.savefig(fn, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Saved {fn}")
+
+def plot_e2e_vs_hparam(df: pd.DataFrame, hparam: str, outdir: str):
+    plt.figure(figsize=(6,4))
+    sns.boxplot(x=hparam, y="e2e_ft_acc", data=df,
+                palette="Greens", showmeans=True)
+    plt.ylabel("Accuracy after E2E FT (%)")
+    plt.title(f"E2E accuracy vs. {hparam}")
+    fn = os.path.join(outdir, f"e2eft_vs_{hparam}.png")
+    plt.savefig(fn, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Saved {fn}")
+
+def main(csv_path: str, outdir: str):
+    df = load_dataframe(csv_path)
+    ensure_dir(outdir)
+
+    # 1) Accuracy vs compression (3 series)
+    plot_acc_vs_compression(df, outdir)
+
+    # 2) Accuracy drop vs λ
+    if "lambda" in df.columns:
+        plot_accdrop_vs_lambda(df, outdir)
+
+    # 3) E2E accuracy vs individual hyper-params
+    for hp in ["m", "d", "e"]:
+        if hp in df.columns:
+            plot_e2e_vs_hparam(df, hp, outdir)
+
+    print("All plots generated in:", outdir)
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--csv", default="crvq_analysis_results.csv",
+                    help="Path to the CSV produced by analysis.py")
+    ap.add_argument("--out", default="plots",
+                    help="Folder to store PNG figures")
+    args = ap.parse_args()
+    main(args.csv, args.out)
+
+
+
+
+
+
+
+
+
+# after running analysis.py
+python plot_crvq_results.py --csv crvq_analysis_results.csv --out plots
