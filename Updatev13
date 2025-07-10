@@ -1,0 +1,92 @@
+# In modules.pyy:
+def importance_metric(W: np.ndarray, Wq: np.ndarray, h_inv_diag: np.ndarray | None):
+    log.debug(f"Computing importance metric for weights of shape {W.shape} "
+              f"and quantised weights of shape {Wq.shape}...")
+    err2 = (W - Wq) ** 2             # squared error for each weight (O x I matrix)
+    sum_err = err2.sum(axis=1)      # sum of squared errors per output channel (length O)
+    err_l2 = np.sqrt(sum_err)       # L2 norm of error per channel
+    if h_inv_diag is None or len(h_inv_diag) != len(err_l2):
+        # If Hessian inverse diag not provided or length mismatched, use ones
+        h_inv_diag = np.ones_like(err_l2)
+    return 0.5 * err_l2 * h_inv_diag
+
+
+
+
+# In crvq.pyy, within quantise_layer, after obtaining residuals for critical vectors:
+if crit_vecs > 0:
+    for step in range(1, self.m):  # for each extended codebook to train
+        resid = V_sorted[idx_crit] - _recon(C_list, B_list)[idx_crit]
+        if np.mean(resid ** 2) < self.eps:
+            break  # residual error is already very low, stop adding codebooks
+        C_ext, B_ext = vq_encode(resid, 2 ** self.e, random_state=step)
+        # **Add a zero-centroid** at index 0 for the extended codebook:
+        C_ext = np.vstack([np.zeros((1, C_ext.shape[1])), C_ext])
+        B_ext = B_ext.astype(int) + 1  # shift existing codes by +1 to make room for zero-centroid
+        # Assign extended codes to critical vectors, and 0 to non-critical vectors:
+        fill_codes = np.zeros_like(B_base, dtype=int)
+        fill_codes[idx_crit] = B_ext
+        # Append the extended codebook and codes to the list
+        C_list.append(C_ext)
+        B_list.append(fill_codes)
+
+
+
+
+
+# After any code reassignments (beam search) in refinement:
+for l in range(1, len(C_list)):  # for each extended codebook (index 1 onward)
+    B_list[l][crit_vecs:] = 0    # enforce non-critical indices to 0
+
+
+
+
+
+
+
+
+
+
+
+
+
+# After initial codebooks (base + extended) are constructed:
+prev_loss = ((V_sorted - _recon(C_list, B_list)) ** 2).sum()
+for it in range(10):  # iterate up to 10 refinement rounds
+    full_recon = _recon(C_list, B_list)  # current reconstructed vectors from all codebooks
+    # --- Centroid Update step ---
+    for l, C in enumerate(C_list):
+        # Compute residual attributable to codebook l
+        recon_l_old = vq_decode(C_list[l], B_list[l])      # contribution of codebook l
+        recon_except_l = full_recon - recon_l_old          # reconstruction from all other codebooks
+        resid_l = V_sorted - recon_except_l                # residual that codebook l should reconstruct
+        # Update each centroid vector j in codebook l:
+        for j in range(C.shape[0]):
+            if l > 0 and j == 0:
+                continue  # skip zero centroid for extended codebooks
+            idx_j = np.where(B_list[l] == j)[0]            # find all vectors using code j
+            if idx_j.size > 0:
+                # set centroid j to the mean of residuals for all vectors assigned to it
+                C_list[l][j] = resid_l[idx_j].mean(axis=0)
+        # Update the full reconstruction for next centroids (incremental update)
+        recon_l_new = vq_decode(C_list[l], B_list[l])
+        full_recon = recon_except_l + recon_l_new
+    # --- Code Assignment step (beam search) ---
+    B_list = beam_search_iterative(V_sorted, C_list, B_list, beam=4, iters=4)
+    # Enforce non-critical channels have zero codes in extended codebooks:
+    for l in range(1, len(C_list)):
+        B_list[l][crit_vecs:] = 0
+    # Check loss improvement
+    cur_loss = ((V_sorted - _recon(C_list, B_list)) ** 2).sum()
+    if (prev_loss - cur_loss) / (prev_loss + 1e-12) < 1e-4:
+        break  # stop if improvement is negligible
+    prev_loss = cur_loss
+
+
+
+
+
+
+V_final   = _recon(C_list, B_list)
+Wq_sorted = reassemble_from_vectors(V_final, O, I, pad, self.d)
+W_quant   = restore_order(Wq_sorted, perm)
