@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=0 python vit_train_no_apex.py --name cifar100-b16h32 --data cifar100 --data_path ./data/cifar100 --model_name ViT-B_16 --pretrain_dir ./pretrain --pretrain ViT-B_16.npz
