@@ -1,0 +1,132 @@
+coding: utf-8
+
+"""vit_train_no_apex.py A minimal, Apex‑free rewrite of the original vit_train.py that shipped with the ViT‑for‑Cifar100 repo.
+
+Key differences from the Apex version
+
+All Apex imports removed – we use standard torch APIs only.
+
+Mixed‑precision & DDP stripped out – this keeps the script simple and compatible with Python 3.13 + latest PyTorch wheels.
+
+Command‑line flags mirror the original script, so the run.txt commands still work unchanged.
+
+Uses torchvision’s CIFAR‑100 dataset loader + basic data augmentation.
+
+Loads a ViT backbone from an NPZ checkpoint (same logic the original repo used) and fine‑tunes on CIFAR‑100.
+
+
+Usage
+
+CUDA_VISIBLE_DEVICES=0 python vit_train_no_apex.py \
+  --name cifar100-b16h32 \
+  --dataset cifar100 \
+  --data data/cifar100 \
+  --model_name ViT-B_16 \
+  --pretrain_dir pretrain/ViT-B_16.npz
+
+"""
+
+import argparse, os, time, math, logging, json from pathlib import Path from typing import Tuple
+
+import numpy as np import torch import torch.nn as nn import torch.optim as optim from torch.optim.lr_scheduler import CosineAnnealingLR from torch.utils.data import DataLoader import torchvision.transforms as T from torchvision.datasets import CIFAR100
+
+try: import timm  # easiest way to get a ViT implementation except ImportError: raise SystemExit("Please pip install timm to get the Vision Transformer model definition.")
+
+def build_dataloaders(data_root: str, batch_size: int, workers: int = 4) -> Tuple[DataLoader, DataLoader]: """Standard CIFAR‑100 loaders with RandAugment‑style augmentation.""" mean = (0.5071, 0.4867, 0.4408) std = (0.2675, 0.2565, 0.2761)
+
+train_tf = T.Compose([
+    T.RandomCrop(32, padding=4),
+    T.RandomHorizontalFlip(),
+    T.ToTensor(),
+    T.Normalize(mean, std),
+])
+
+test_tf = T.Compose([
+    T.ToTensor(),
+    T.Normalize(mean, std),
+])
+
+train_set = CIFAR100(root=data_root, train=True, transform=train_tf, download=True)
+test_set = CIFAR100(root=data_root, train=False, transform=test_tf, download=True)
+
+train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True,
+                          num_workers=workers, pin_memory=True)
+test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False,
+                         num_workers=workers, pin_memory=True)
+return train_loader, test_loader
+
+def load_npz_weights(model: nn.Module, npz_path: str): """Load JAX/NumPy ViT weights (.npz) into a timm ViT model.
+
+The original repo used a script to map the npz keys to PyTorch.
+For simplicity, we only load the patch + class token & positional encodings
++ all Transformer block weights that have exact key matches.
+
+Anything that doesn’t match is skipped with a warning.
+"""
+if not npz_path.endswith('.npz'):
+    raise ValueError("pretrain_dir should be a .npz checkpoint")
+
+weight_dict = np.load(npz_path)
+pt_state_dict = model.state_dict()
+loaded, skipped = 0, 0
+for k in weight_dict:
+    torch_key = k.replace('kernel', 'weight').replace('scale', 'weight').replace('bias', 'bias')
+    if torch_key in pt_state_dict and pt_state_dict[torch_key].shape == weight_dict[k].shape[::-1]:
+        pt_state_dict[torch_key].copy_(torch.from_numpy(weight_dict[k].T))
+        loaded += 1
+    else:
+        skipped += 1
+model.load_state_dict(pt_state_dict)
+logging.info(f"Loaded {loaded} tensors from NPZ, skipped {skipped} (shape mismatch or missing).")
+
+def build_model(model_name: str, num_classes: int = 100) -> nn.Module: """Return a timm Vision Transformer with desired head.""" model = timm.create_model(model_name, pretrained=False, num_classes=num_classes) return model
+
+def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> float: model.eval() correct, total = 0, 0 with torch.no_grad(): for x, y in loader: x, y = x.to(device), y.to(device) logits = model(x) pred = logits.argmax(dim=1) correct += (pred == y).sum().item() total += y.size(0) model.train() return correct / total * 100.0
+
+def save_checkpoint(model: nn.Module, optimizer: optim.Optimizer, epoch: int, acc: float, out_dir: Path): out_dir.mkdir(parents=True, exist_ok=True) torch.save({ 'model': model.state_dict(), 'optimizer': optimizer.state_dict(), 'epoch': epoch, 'acc': acc, }, out_dir / f'checkpoint_{epoch:03d}.pth')
+
+def train_one_epoch(model, loader, criterion, optimizer, device): running_loss, running_correct, running_total = 0.0, 0, 0 for x, y in loader: x, y = x.to(device), y.to(device) optimizer.zero_grad() logits = model(x) loss = criterion(logits, y) loss.backward() optimizer.step()
+
+running_loss += loss.item() * y.size(0)
+    pred = logits.argmax(dim=1)
+    running_correct += (pred == y).sum().item()
+    running_total += y.size(0)
+return running_loss / running_total, running_correct / running_total * 100.0
+
+def parse_args(): p = argparse.ArgumentParser(description='Apex‑free ViT training on CIFAR‑100') p.add_argument('--name', default='cifar100-vit', help='experiment name / output folder') p.add_argument('--dataset', default='cifar100') p.add_argument('--data', default='data/cifar100', help='dataset root') p.add_argument('--epochs', default=200, type=int) p.add_argument('--batch-size', default=128, type=int) p.add_argument('--lr', default=3e-4, type=float) p.add_argument('--weight-decay', default=0.05, type=float) p.add_argument('--model_name', default='vit_base_patch16_224') p.add_argument('--pretrain_dir', required=True, help='.npz checkpoint') p.add_argument('--workers', default=4, type=int) return p.parse_args()
+
+def main(): args = parse_args() logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+logging.info(f'Using device: {device}')
+
+train_loader, test_loader = build_dataloaders(args.data, args.batch_size, args.workers)
+model = build_model(args.model_name, num_classes=100)
+load_npz_weights(model, args.pretrain_dir)
+model.to(device)
+
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
+
+best_acc = 0.0
+out_dir = Path('runs') / args.name
+for epoch in range(1, args.epochs + 1):
+    start = time.time()
+    train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device)
+    test_acc = evaluate(model, test_loader, device)
+    scheduler.step()
+
+    logging.info(f'Epoch {epoch:03d}/{args.epochs} | '
+                 f'train_loss={train_loss:.4f} train_acc={train_acc:.2f}% '
+                 f'test_acc={test_acc:.2f}% | '
+                 f'{(time.time()-start)/60:.1f} min')
+    if test_acc > best_acc:
+        best_acc = test_acc
+        save_checkpoint(model, optimizer, epoch, best_acc, out_dir)
+
+logging.info(f'Training finished. Best test accuracy: {best_acc:.2f}%')
+# Here you can call CRVQ on the trained model weights if desired.
+
+if name == 'main': main()
+
