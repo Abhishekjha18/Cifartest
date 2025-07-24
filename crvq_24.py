@@ -1,0 +1,178 @@
+# -*- coding: utf-8 -*-
+"""crvq_final.py - orchestrator implementing CRVQ Algorithm 1 for all Linear layers.
+   Requires modules.py utilities.  Fully debugged (safe indices, proper VQ encode/decode).
+"""
+from __future__ import annotations
+from datetime import datetime
+import logging, numpy as np, torch
+from modules import (
+    partition_to_vectors, reassemble_from_vectors,
+    vq_encode, vq_decode,
+    importance_metric, reorder_channels, restore_order,
+    beam_search_iterative, compression_ratio
+)
+from finetune import fine_tune_codebooks
+
+log = logging.getLogger("crvq")
+log.addHandler(logging.NullHandler())
+file_handler = logging.FileHandler('logs_test.log')
+log.addHandler(file_handler)
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(filename)s - %(message)s')
+file_handler.setFormatter(formatter)
+
+class CRVQ:
+    """Channel-Relaxed Vector Quantisation (Algorithm 1)."""
+
+    def __init__(self, d=8, e=8, m=4, lam=0.05, eps=1e-3):
+        self.d, self.e, self.m, self.lam, self.eps = d, e, m, lam, eps
+        self.state = {}
+        print("********************************************************************************************************")
+        log.info(f"Test is for m= {self.m}, d = {self.d}, e= {self.e}, lambda={self.lam}")
+        print("********************************************************************************************************")
+
+    # ------------------------------------------------------------------ #
+    def quantise_layer(self, name: str, W: torch.Tensor,
+                       h_diag: np.ndarray | None = None) -> torch.Tensor:
+        """Quantise a 2D weight matrix.  Returns quantised weights (same dtype)."""
+        log.info(f"Quantising layer {name} with shape {W.shape}...")
+        print("TIME STAMP: ",datetime.now().strftime("-%m-%d %H:%M:%S"))
+        if W.ndim != 2:
+            raise ValueError(f"Layer {name} weights must be 2D (got {W.ndim}D tensor).")
+        Wnp = W.detach().cpu().numpy()
+        O, I = Wnp.shape
+
+        # ───── Step 3: Pre-quantization (coarse VQ) ─────────────────────
+        V, pad = partition_to_vectors(Wnp, self.d)
+        if V.shape[0] == 0:
+            log.warning(f"Layer {name}: no vectors to quantise; returning original weights.")
+            return W
+        C_coarse, B_coarse = vq_encode(V, 2 ** min(6, self.e))
+        Vq_coarse = vq_decode(C_coarse, B_coarse)
+        Wq_coarse = reassemble_from_vectors(Vq_coarse, O, I, pad, self.d)
+
+        # ───── Step 4: Importance (max error × Hessian-inv diag) ────────
+        print("TIME STAMP: ",datetime.now().strftime("-%m-%d %H:%M:%S"))
+        log.info(f"Layer {name}: computing importance metric...")
+        log.debug(f"Layer {name}: Hessian diag shape {h_diag.shape if h_diag is not None else None}")
+        imp = importance_metric(Wnp, Wq_coarse, h_diag)
+
+        # ───── Step 5: Reorder channels by importance ───────────────────
+        log.info(f"Layer {name}: reordering channels by importance...")
+        W_sorted, perm = reorder_channels(Wnp, imp)
+
+        # ───── Steps 6-7: Base codebook VQ on all channels ──────────────
+        V_sorted, pad = partition_to_vectors(W_sorted, self.d)
+        C_base, B_base = vq_encode(V_sorted, 2 ** self.e)
+        Vq_base        = vq_decode(C_base, B_base)
+        base_mse = np.mean((V_sorted - Vq_base) ** 2)
+        log.debug(f"Base codebook MSE {base_mse:.4e}")
+        C_list, B_list = [C_base], [B_base]
+
+        # ───── Steps 8-13: Extended codebooks on λ-fraction of channels ─
+        v_per_row = I // self.d
+        if v_per_row == 0:
+            log.warning(f"Layer {name}: in_features({I}) < d({self.d}); skipping CRVQ on this layer.")
+            return W  # return original tensor unchanged
+
+        n_vectors = V_sorted.shape[0]
+        # safe_lambda=min(self.lam,256*(self.m-1)/n_vectors) #######new added safelambda
+        crit_rows = max(1, int(self.lam * O))
+        crit_vecs = min(crit_rows * v_per_row, n_vectors)
+        idx_crit  = np.arange(crit_vecs)
+        log.info(f"Selected {crit_rows} critical channels -> {crit_vecs} vectors for extended codebooks.")
+        print("TIME STAMP: ",datetime.now().strftime("-%m-%d %H:%M:%S"))
+        if crit_vecs > 0:
+            # Current reconstructed vectors for critical set using base codebook
+            W_l_enc = _recon(C_list, B_list)[idx_crit]
+            for step in range(1, self.m):
+                # Compute residual on critical vectors
+                W_optim = V_sorted[idx_crit]
+                resid = W_optim - W_l_enc
+                log.debug(f"Residual MSE before codebook {step}: {np.mean(resid ** 2):.4e}")
+                if np.mean(resid ** 2) < self.eps:
+                    break  # stop if residual error is very low
+                # Train an extended codebook on the residuals of critical vectors
+                C_ext, B_ext = vq_encode(resid, 2 ** self.e, random_state=step)
+                # Ensure extended codebook has a zero-centroid for "no change"
+                if C_ext.shape[0] > 0:
+                    C_ext[0] = np.zeros_like(C_ext[0])
+                    # Reassign codes with centroid[0] = 0
+                    diff = resid[:, None, :] - C_ext[None, :, :]
+                    dist = np.sum(diff ** 2, axis=2)
+                    B_ext = dist.argmin(axis=1).astype(B_ext.dtype)
+                Vq_ext = vq_decode(C_ext, B_ext)
+                # Store codes only for critical vectors, zeros elsewhere
+                fill_codes = np.zeros_like(B_base)
+                fill_codes[idx_crit] = B_ext
+                C_list.append(C_ext.astype(np.float32))
+                B_list.append(fill_codes)
+                # Update reconstructed vectors for critical set
+                W_l_enc = W_l_enc + Vq_ext
+                print("TIME STAMP: ",datetime.now().strftime("-%m-%d %H:%M:%S"))
+
+             
+
+        log.info(f"RECONSTRUCTION ERROR (before the refinement loop starts)= {np.sum((V_sorted - _recon(C_list, B_list))**2)}")
+        threshold = 1e-3  # relative improvement threshold
+        prev_error = np.sum((V_sorted - _recon(C_list, B_list))**2)
+        prev_error = float('inf')
+        import time
+        start_time= time.time()
+        while True:  # or for a max number of iterations
+            # Compute error before beam search and refinement
+            log.info(f"BEAM SEARCH STARTING")
+            print("TIME STAMP: ", datetime.now().strftime("-%m-%d %H:%M:%S"))
+
+            # Beam search step
+            B_list = beam_search_iterative(V_sorted, C_list, B_list, beam=4, iters=1)
+            log.info(f"Datatypes for codebooks {C_list[0].dtype}, for codes(or labels) {B_list[0].dtype}")
+
+            error_after_bs = np.sum((V_sorted - _recon(C_list, B_list)) ** 2)
+            log.info(f"Error After Beam Search-------------{error_after_bs}")
+
+            # Codebook refinement step
+            fine_tune_codebooks(C_list, B_list, V_sorted, device='cuda')
+
+            error_after_refine = np.sum((V_sorted - _recon(C_list, B_list)) ** 2)
+            log.info(f"Error after codebook refinement-------------{error_after_refine}")
+
+            # Calculate relative improvement
+            rel_improvement = (prev_error - error_after_refine) / (prev_error + 1e-12)
+            log.info(f"Relative improvement: {rel_improvement:.6f}")
+
+            # Update prev_error
+            prev_error = error_after_refine
+            time_in_loop=time.time()
+
+            # Check stopping condition
+            if rel_improvement < threshold or ((time_in_loop-start_time) >= 600):
+                log.info(f"Converged with relative improvement {rel_improvement:.6f} < threshold {threshold}")
+                log.info(f"{(start_time-time_in_loop)/60} mins elapsed")
+                break
+        log.info(f"Final Recon Error= {np.sum((V_sorted - _recon(C_list, B_list))**2)}")
+        # ───── Reconstruction & restore order ──────────────────────────
+        V_final   = _recon(C_list, B_list)
+        Wq_sorted = reassemble_from_vectors(V_final, O, I, pad, self.d)
+        W_quant   = restore_order(Wq_sorted, perm)
+
+        cr, bpp = compression_ratio(O, I, self.d, self.e, len(C_list), self.lam)
+        print("********************************************************************************************************")
+        log.info(f"*Layer {name}: compression ≈{cr:.1f}x  ({bpp:.2f} bits/param)")
+        print("********************************************************************************************************")
+
+        # Save quantization state (for analysis or decoding)
+        self.state[name] = dict(codebooks=C_list, codes=B_list, perm=perm)
+        return torch.tensor(W_quant, dtype=W.dtype)
+
+# ----------------------------------------------------------------------
+# Helper: vector reconstruction from codebooks
+# ----------------------------------------------------------------------
+def _recon(C_list, B_list):
+    """Reconstruct vectors from codebooks and codes."""
+    if not C_list or not B_list:
+        raise ValueError("C_list and B_list must not be empty.")
+    # Start with base codebook reconstruction
+    v = vq_decode(C_list[0], B_list[0])
+    for C, B in zip(C_list[1:], B_list[1:]):
+        v += vq_decode(C, B)
+    return v
